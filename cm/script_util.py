@@ -1,7 +1,7 @@
 import argparse
 
-from .karras_diffusion import KarrasDenoiser
-from .unet import UNetModel
+from karras_diffusion import KarrasDenoiser
+from unet import UNetModel
 import numpy as np
 
 NUM_CLASSES = 1000
