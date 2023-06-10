@@ -18,7 +18,6 @@ from nn import (
     timestep_embedding,
 )
 
-
 class AttentionPool2d(nn.Module):
     """
     Adapted from CLIP: https://github.com/openai/CLIP/blob/main/clip/model.py
@@ -290,7 +289,7 @@ class AttentionBlock(nn.Module):
         self.qkv = conv_nd(dims, channels, channels * 3, 1)
         self.attention_type = attention_type
         if attention_type == "flash":
-            # self.attention = QKVFlashAttention(channels, self.num_heads)
+            self.attention = QKVFlashAttention(channels, self.num_heads)
             pass
         else:
             # split heads before split qkv
@@ -323,56 +322,58 @@ class AttentionBlock(nn.Module):
                 self.attention, (qkv, encoder_out), (), self.use_attention_checkpoint
             )
         else:
-            h = checkpoint(self.attention, (qkv,), (), self.use_attention_checkpoint)
+            h = checkpoint(self.attention, (qkv,), (), self.use_attention_checkpoint)   
         h = h.view(b, -1, *spatial)
         h = self.proj_out(h)
         return x + h
 
 
-# class QKVFlashAttention(nn.Module):
-#     def __init__(
-#         self,
-#         embed_dim,
-#         num_heads,
-#         batch_first=True,
-#         attention_dropout=0.0,
-#         causal=False,
-#         device=None,
-#         dtype=None,
-#         **kwargs,
-#     ) -> None:
-#         from einops import rearrange
-#         from flash_attn.flash_attention import FlashAttention
+class QKVFlashAttention(nn.Module):
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        batch_first=True,
+        attention_dropout=0.0,
+        causal=False,
+        device=None,
+        dtype=None,
+        **kwargs,
+    ) -> None:
+        from einops import rearrange
+        from flash_attn.flash_attention import FlashAttention
 
-#         assert batch_first
-#         factory_kwargs = {"device": device, "dtype": dtype}
-#         super().__init__()
-#         self.embed_dim = embed_dim
-#         self.num_heads = num_heads
-#         self.causal = causal
+        assert batch_first
+        # factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.causal = causal
 
-#         assert (
-#             self.embed_dim % num_heads == 0
-#         ), "self.kdim must be divisible by num_heads"
-#         self.head_dim = self.embed_dim // num_heads
-#         assert self.head_dim in [16, 32, 64], "Only support head_dim == 16, 32, or 64"
+        assert (
+            self.embed_dim % num_heads == 0
+        ), "self.kdim must be divisible by num_heads"
+        self.head_dim = self.embed_dim // num_heads
+        assert self.head_dim in [16, 32, 64], "Only support head_dim == 16, 32, or 64"
 
-#         self.inner_attn = FlashAttention(
-#             attention_dropout=attention_dropout, **factory_kwargs
-#         )
-#         self.rearrange = rearrange
+        self.inner_attn = FlashAttention(
+            attention_dropout=attention_dropout,
+        )
+        self.rearrange = rearrange
 
-#     def forward(self, qkv, attn_mask=None, key_padding_mask=None, need_weights=False):
-#         qkv = self.rearrange(
-#             qkv, "b (three h d) s -> b s three h d", three=3, h=self.num_heads
-#         )
-#         qkv, _ = self.inner_attn(
-#             qkv,
-#             key_padding_mask=key_padding_mask,
-#             need_weights=need_weights,
-#             causal=self.causal,
-#         )
-#         return self.rearrange(qkv, "b s h d -> b (h d) s")
+    def forward(self, qkv, attn_mask=None, key_padding_mask=None, need_weights=False):
+        qkv = qkv.half()
+        qkv = self.rearrange(
+            qkv, "b (three h d) s -> b s three h d", three=3, h=self.num_heads
+        )
+        qkv, _ = self.inner_attn(
+            qkv,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            causal=self.causal,
+        )
+        qkv = qkv.float()
+        return self.rearrange(qkv, "b s h d -> b (h d) s")
 
 
 def count_flops_attn(model, _x, y):
@@ -403,6 +404,9 @@ class QKVAttentionLegacy(nn.Module):
     def __init__(self, n_heads):
         super().__init__()
         self.n_heads = n_heads
+        from einops import rearrange
+        self.rearrange = rearrange
+
 
     def forward(self, qkv):
         """
@@ -414,13 +418,23 @@ class QKVAttentionLegacy(nn.Module):
         bs, width, length = qkv.shape
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
-        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
+        qkv = qkv.half()
+
+        qkv =   self.rearrange(
+            qkv, "b (three h d) s -> b s three h d", three=3, h=self.n_heads
+        ) 
+        q, k, v = qkv.transpose(1, 3).transpose(3, 4).split(1, dim=2)
+        q = q.reshape(bs*self.n_heads, ch, length)
+        k = k.reshape(bs*self.n_heads, ch, length)
+        v = v.reshape(bs*self.n_heads, ch, length)
+
         scale = 1 / math.sqrt(math.sqrt(ch))
         weight = th.einsum(
             "bct,bcs->bts", q * scale, k * scale
         )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+        weight = th.softmax(weight, dim=-1).type(weight.dtype)
         a = th.einsum("bts,bcs->bct", weight, v)
+        a = a.float()
         return a.reshape(bs, -1, length)
 
     @staticmethod
@@ -765,6 +779,7 @@ class UNetModel(nn.Module):
         for module in self.input_blocks:
             h = module(h, emb)
             hs.append(h)
+        # return hs
         h = self.middle_block(h, emb)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
